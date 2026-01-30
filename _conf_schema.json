@@ -52,5 +52,29 @@
     "type": "string",
     "hint": "与 GitHub Webhook 设置中的 Secret 保持一致以验证请求",
     "default": ""
+  },
+  "codeberg_token": {
+    "description": "Codeberg API访问令牌",
+    "type": "string",
+    "hint": "可选项。提供Codeberg API令牌可以增加API请求限制以及访问私有仓库。",
+    "obvious_hint": true
+  },
+  "enable_codeberg_webhook": {
+    "description": "启用 Codeberg Webhook 模式",
+    "type": "bool",
+    "hint": "开启后将为Codeberg仓库启动 Webhook 服务",
+    "default": false
+  },
+  "codeberg_webhook_path": {
+    "description": "Codeberg Webhook 请求路径",
+    "type": "string",
+    "hint": "Codeberg Webhook 配置中的路径，需以/开头",
+    "default": "/codeberg/webhook"
+  },
+  "codeberg_webhook_secret": {
+    "description": "Codeberg Webhook 验证密钥",
+    "type": "string",
+    "hint": "与 Codeberg Webhook 设置中的 Secret 保持一致以验证请求",
+    "default": ""
   }
 }
