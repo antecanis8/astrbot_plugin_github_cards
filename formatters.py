@@ -428,9 +428,10 @@ def format_webhook_create_message(
     return "\n".join(message_lines)
 
 
-def format_issue_details(repo: str, issue_data: dict[str, Any]) -> str:
+def format_issue_details(repo: str, issue_data: dict[str, Any], platform: str = "github") -> str:
     if "pull_request" in issue_data:
-        return f"#{issue_data['number']} 是一个 PR，请使用 /ghpr 命令查看详情"
+        cmd_prefix = "gh" if platform == "github" else "cb"
+        return f"#{issue_data['number']} 是一个 PR，请使用 /{cmd_prefix}pr 命令查看详情"
 
     created_str = issue_data["created_at"].replace("Z", "+00:00")
     updated_str = issue_data["updated_at"].replace("Z", "+00:00")
@@ -441,8 +442,10 @@ def format_issue_details(repo: str, issue_data: dict[str, Any]) -> str:
     status = "开启" if issue_data["state"] == "open" else "已关闭"
     labels = ", ".join([label["name"] for label in issue_data.get("labels", [])])
 
+    platform_label = "GitHub" if platform == "github" else "Codeberg"
+
     result = (
-        f"🔍 Issue 详情 | {repo}#{issue_data['number']}\n"
+        f"🔍 {platform_label} Issue 详情 | {repo}#{issue_data['number']}\n"
         f"标题: {issue_data['title']}\n"
         f"状态: {status}\n"
         f"创建者: {issue_data['user']['login']}\n"
@@ -469,7 +472,7 @@ def format_issue_details(repo: str, issue_data: dict[str, Any]) -> str:
     return result
 
 
-def format_pr_details(repo: str, pr_data: dict[str, Any]) -> str:
+def format_pr_details(repo: str, pr_data: dict[str, Any], platform: str = "github") -> str:
     created_str = pr_data["created_at"].replace("Z", "+00:00")
     updated_str = pr_data["updated_at"].replace("Z", "+00:00")
 
@@ -484,8 +487,10 @@ def format_pr_details(repo: str, pr_data: dict[str, Any]) -> str:
 
     labels = ", ".join([label["name"] for label in pr_data.get("labels", [])])
 
+    platform_label = "GitHub" if platform == "github" else "Codeberg"
+
     result = (
-        f"🔀 PR 详情 | {repo}#{pr_data['number']}\n"
+        f"🔀 {platform_label} PR 详情 | {repo}#{pr_data['number']}\n"
         f"标题: {pr_data['title']}\n"
         f"状态: {status}\n"
         f"创建者: {pr_data['user']['login']}\n"

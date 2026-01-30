@@ -6,7 +6,7 @@ import re
 import sys
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 import aiohttp
 
@@ -15,8 +15,28 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
-from . import formatters
-from .webhook_server import GitHubWebhookServer
+try:
+    from . import formatters
+    from .webhook_server import (
+        GitHubWebhookServer,
+        MultiPlatformWebhookServer,
+        PlatformConfig,
+    )
+    from .platforms import PLATFORMS
+    from .platforms.github import GitHubProvider
+    from .platforms.codeberg import CodebergProvider
+    from .platforms.base import PlatformProvider
+except ImportError:  # pragma: no cover - fallback for direct module import
+    import formatters
+    from webhook_server import (
+        GitHubWebhookServer,
+        MultiPlatformWebhookServer,
+        PlatformConfig,
+    )
+    from platforms import PLATFORMS
+    from platforms.github import GitHubProvider
+    from platforms.codeberg import CodebergProvider
+    from platforms.base import PlatformProvider
 
 PLUGIN_DIR = os.path.dirname(__file__)
 if PLUGIN_DIR not in sys.path:
@@ -33,6 +53,13 @@ GITHUB_ISSUES_API_URL = "https://api.github.com/repos/{repo}/issues"
 GITHUB_ISSUE_API_URL = "https://api.github.com/repos/{repo}/issues/{issue_number}"
 GITHUB_PR_API_URL = "https://api.github.com/repos/{repo}/pulls/{pr_number}"
 GITHUB_RATE_LIMIT_URL = "https://api.github.com/rate_limit"
+
+# Codeberg API URLs
+CODEBERG_API_URL = "https://codeberg.org/api/v1/repos/{repo}"
+CODEBERG_README_API_URL = "https://codeberg.org/api/v1/repos/{repo}/contents/README.md"
+CODEBERG_ISSUES_API_URL = "https://codeberg.org/api/v1/repos/{repo}/issues"
+CODEBERG_ISSUE_API_URL = "https://codeberg.org/api/v1/repos/{repo}/issues/{issue_number}"
+CODEBERG_PR_API_URL = "https://codeberg.org/api/v1/repos/{repo}/pulls/{pr_number}"
 
 # Path for storing subscription data
 SUBSCRIPTION_FILE = "data/github_subscriptions.json"
@@ -56,6 +83,8 @@ class MyPlugin(Star):
         self.subscriptions = self._load_subscriptions()
         self.default_repos = self._load_default_repos()
         self.link_settings = self._load_link_settings()
+        # Migrate old data format if needed
+        self._migrate_data_if_needed()
         self.last_check_time = {}  # Store the last check time for each repo
         self.use_lowercase = self.config.get("use_lowercase_repo", True)
         self.auto_resolve_links = self.config.get("auto_resolve_links", True)
@@ -66,20 +95,53 @@ class MyPlugin(Star):
         self.webhook_port = int(self.config.get("webhook_port", 6192))
         self.webhook_secret = self.config.get("webhook_secret", "")
         self.webhook_path = self.config.get("webhook_path", "/github/webhook")
+        self.codeberg_token = self.config.get("codeberg_token", "")
+        self.enable_codeberg_webhook = bool(
+            self.config.get("enable_codeberg_webhook", False)
+        )
+        self.codeberg_webhook_path = self.config.get(
+            "codeberg_webhook_path", "/codeberg/webhook"
+        )
+        self.codeberg_webhook_secret = self.config.get("codeberg_webhook_secret", "")
         self.webhook_server: Any | None = None
         self.task: asyncio.Task[Any] | None = None
 
-        if self.enable_webhook:
-            server = GitHubWebhookServer(
-                plugin=self,
-                host=self.webhook_host,
-                port=self.webhook_port,
-                secret=self.webhook_secret,
-                path=self.webhook_path,
-            )
-            self.webhook_server = server
-            server.start()
-            logger.info("GitHub Cards Plugin 初始化完成，启用 Webhook 模式")
+        if self.enable_webhook or self.enable_codeberg_webhook:
+            platforms_config: list[PlatformConfig] = []
+
+            if self.enable_webhook:
+                platforms_config.append(
+                    {
+                        "platform": GitHubProvider(),
+                        "path": self.webhook_path,
+                        "secret": self.webhook_secret,
+                    }
+                )
+
+            if self.enable_codeberg_webhook:
+                platforms_config.append(
+                    {
+                        "platform": CodebergProvider(),
+                        "path": self.codeberg_webhook_path,
+                        "secret": self.codeberg_webhook_secret,
+                    }
+                )
+
+            if platforms_config:
+                server = MultiPlatformWebhookServer(
+                    plugin=cast(Any, self),
+                    host=self.webhook_host,
+                    port=self.webhook_port,
+                    platforms_config=platforms_config,
+                )
+                self.webhook_server = server
+                server.start()
+                logger.info("GitHub Cards Plugin 初始化完成，启用 Webhook 模式")
+            else:
+                self.task = asyncio.create_task(self._check_updates_periodically())
+                logger.info(
+                    f"GitHub Cards Plugin初始化完成，检查间隔: {self.check_interval}分钟"
+                )
         else:
             # Start background task to check for updates when webhook is disabled
             self.task = asyncio.create_task(self._check_updates_periodically())
@@ -105,6 +167,85 @@ class MyPlugin(Star):
                 json.dump(self.subscriptions, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"保存订阅数据失败: {e}")
+
+    def _migrate_data_if_needed(self) -> bool:
+        """Migrate old data format to new format with platform prefix.
+
+        Old format: {"owner/repo": ["subscriber1", ...]}
+        New format: {"github:owner/repo": ["subscriber1", ...]}
+
+        Returns True if migration was performed.
+        """
+        migrated = False
+
+        # Check if any subscription key lacks platform prefix
+        needs_migration = any(
+            ":" not in key for key in self.subscriptions.keys()
+        )
+
+        if needs_migration:
+            logger.info("检测到旧格式订阅数据，开始迁移...")
+
+            # Create backup
+            if os.path.exists(SUBSCRIPTION_FILE):
+                backup_file = SUBSCRIPTION_FILE + ".bak"
+                try:
+                    import shutil
+                    shutil.copy2(SUBSCRIPTION_FILE, backup_file)
+                    logger.info(f"已创建订阅数据备份: {backup_file}")
+                except Exception as e:
+                    logger.error(f"创建订阅数据备份失败: {e}")
+                    return False
+
+            # Migrate subscriptions
+            new_subscriptions: dict[str, list[str]] = {}
+            for key, subscribers in self.subscriptions.items():
+                if ":" not in key:
+                    new_key = f"github:{key}"
+                else:
+                    new_key = key
+                new_subscriptions[new_key] = subscribers
+
+            self.subscriptions = new_subscriptions
+            self._save_subscriptions()
+            logger.info(f"已迁移 {len(new_subscriptions)} 个订阅到新格式")
+            migrated = True
+
+        # Also migrate default repos
+        default_needs_migration = any(
+            ":" not in key or ":" not in value
+            for key, value in self.default_repos.items()
+        )
+
+        if default_needs_migration:
+            logger.info("检测到旧格式默认仓库数据，开始迁移...")
+
+            # Create backup
+            if os.path.exists(DEFAULT_REPO_FILE):
+                backup_file = DEFAULT_REPO_FILE + ".bak"
+                try:
+                    import shutil
+                    shutil.copy2(DEFAULT_REPO_FILE, backup_file)
+                    logger.info(f"已创建默认仓库数据备份: {backup_file}")
+                except Exception as e:
+                    logger.error(f"创建默认仓库数据备份失败: {e}")
+
+            # Migrate default repos - only the value needs platform prefix
+            new_default_repos: dict[str, str] = {}
+            for key, value in self.default_repos.items():
+                # Value is the repo name, add github: prefix if missing
+                if ":" not in value:
+                    new_value = f"github:{value}"
+                else:
+                    new_value = value
+                new_default_repos[key] = new_value
+
+            self.default_repos = new_default_repos
+            self._save_default_repos()
+            logger.info(f"已迁移 {len(new_default_repos)} 个默认仓库设置到新格式")
+            migrated = True
+
+        return migrated
 
     def _load_default_repos(self) -> dict[str, str]:
         """Load default repo settings from JSON file"""
@@ -148,15 +289,31 @@ class MyPlugin(Star):
         """Normalize repository name according to configuration"""
         return repo.lower() if self.use_lowercase else repo
 
-    def _resolve_repo_key(self, repo: str) -> str | None:
+    def _resolve_repo_key(self, repo: str, platform: str = "github") -> str | None:
         """Resolve stored subscription key that matches the provided repo name."""
+        # Build the full key with platform prefix
+        full_key = f"{platform}:{repo}"
+
+        if full_key in self.subscriptions:
+            return full_key
+
+        # Also check without prefix for backward compatibility during transition
         if repo in self.subscriptions:
             return repo
 
+        # Normalize and search
         normalized = self._normalize_repo_name(repo)
-        for stored_repo in self.subscriptions.keys():
-            if self._normalize_repo_name(stored_repo) == normalized:
-                return stored_repo
+        normalized_full = f"{platform}:{normalized}"
+
+        for stored_key in self.subscriptions.keys():
+            # Extract the repo part (after colon if exists)
+            if ":" in stored_key:
+                stored_platform, stored_repo = stored_key.split(":", 1)
+            else:
+                stored_platform, stored_repo = "github", stored_key
+
+            if stored_platform == platform and self._normalize_repo_name(stored_repo) == normalized:
+                return stored_key
 
         return None
 
@@ -166,6 +323,68 @@ class MyPlugin(Star):
         if self.github_token:
             headers["Authorization"] = f"token {self.github_token}"
         return headers
+
+    def _get_codeberg_headers(self) -> dict[str, str]:
+        """Get Codeberg API headers with token if available"""
+        headers = {"Accept": "application/json"}
+        if self.codeberg_token:
+            headers["Authorization"] = f"token {self.codeberg_token}"
+        return headers
+
+    def _get_provider(self, platform: str = "github") -> PlatformProvider:
+        """Get platform provider by name"""
+        if platform == "github":
+            return GitHubProvider()
+        if platform == "codeberg":
+            return CodebergProvider()
+        raise ValueError(f"Unknown platform: {platform}")
+
+    async def _subscribe_repo_internal(
+        self, event: AstrMessageEvent, repo: str, platform: str = "github"
+    ) -> str | None:
+        """Internal method to subscribe to a repository on any platform.
+        Returns success message or None if failed.
+        """
+        if not self._is_valid_repo(repo):
+            return None  # Caller should handle error message
+
+        # Get appropriate API URL and headers
+        if platform == "github":
+            api_url = GITHUB_API_URL.format(repo=repo)
+            headers = self._get_github_headers()
+        else:  # codeberg
+            api_url = CODEBERG_API_URL.format(repo=repo)
+            headers = self._get_codeberg_headers()
+
+        # Check if the repo exists
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        return None
+                    repo_data = await resp.json()
+                    display_name = repo_data.get("full_name", repo)
+        except Exception as e:
+            logger.error(f"访问 {platform} API 失败: {e}")
+            return None
+
+        # Normalize repository name
+        normalized_repo = self._normalize_repo_name(repo)
+        subscriber_id = event.unified_msg_origin
+
+        # Build key with platform prefix
+        repo_key = self._resolve_repo_key(repo, platform)
+        if not repo_key:
+            repo_key = f"{platform}:{normalized_repo if self.use_lowercase else display_name}"
+
+        subscribers = self.subscriptions.setdefault(repo_key, [])
+
+        if subscriber_id not in subscribers:
+            subscribers.append(subscriber_id)
+            self._save_subscriptions()
+            return f"成功订阅 {platform.capitalize()} 仓库 {display_name} 的事件更新。"
+        else:
+            return f"你已经订阅了 {platform.capitalize()} 仓库 {display_name}"
 
     @filter.regex(GITHUB_URL_PATTERN)
     async def github_repo(self, event: AstrMessageEvent):
@@ -736,7 +955,7 @@ class MyPlugin(Star):
             yield event.plain_result(f"获取 PR 详情时出错: {str(e)}")
 
     def _parse_issue_reference(
-        self, reference: str, msg_origin: str | None = None
+        self, reference: str, msg_origin: str | None = None, platform: str = "github"
     ) -> tuple[str | None, str | None]:
         """Parse issue/PR reference string in various formats"""
         # Try format 'owner/repo#number' or 'owner/repo number'
@@ -753,20 +972,35 @@ class MyPlugin(Star):
         if reference.isdigit():
             # First check for default repo for this conversation
             if msg_origin and msg_origin in self.default_repos:
-                return self.default_repos[msg_origin], reference
+                default = self.default_repos[msg_origin]
+                # Check if default matches the requested platform
+                if ":" in default:
+                    stored_platform, stored_repo = default.split(":", 1)
+                    if stored_platform == platform:
+                        return stored_repo, reference
+                elif platform == "github":
+                    # Legacy format without prefix, assume GitHub
+                    return default, reference
 
-            # Next check if there's exactly one subscription
+            # Next check if there's exactly one subscription for the specific platform
             if msg_origin:
                 user_subscriptions = []
                 for repo, subscribers in self.subscriptions.items():
                     if msg_origin in subscribers:
-                        user_subscriptions.append(repo)
+                        # Filter by platform
+                        if ":" in repo:
+                            stored_platform, stored_repo = repo.split(":", 1)
+                            if stored_platform == platform:
+                                user_subscriptions.append(stored_repo)
+                        elif platform == "github":
+                            # Legacy format without prefix, assume GitHub
+                            user_subscriptions.append(repo)
 
                 if len(user_subscriptions) == 1:
                     return user_subscriptions[0], reference
                 elif len(user_subscriptions) > 1:
                     logger.debug(
-                        f"Found multiple subscriptions for {msg_origin}, can't determine default repo"
+                        f"Found multiple {platform} subscriptions for {msg_origin}, can't determine default repo"
                     )
 
         return None, None
@@ -871,6 +1105,51 @@ class MyPlugin(Star):
                 logger.error(f"获取 PR {repo}#{pr_number} 时出错: {e}")
                 return None
 
+    async def _fetch_codeberg_issue_data(self, repo: str, issue_number: str) -> dict[str, Any] | None:
+        """Fetch issue data from Codeberg API"""
+        async with aiohttp.ClientSession() as session:
+            try:
+                url = CODEBERG_ISSUE_API_URL.format(repo=repo, issue_number=issue_number)
+                async with session.get(url, headers=self._get_codeberg_headers()) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    else:
+                        logger.error(f"获取 Codeberg Issue {repo}#{issue_number} 失败: {resp.status}")
+                        return None
+            except Exception as e:
+                logger.error(f"获取 Codeberg Issue {repo}#{issue_number} 时出错: {e}")
+                return None
+
+    async def _fetch_codeberg_pr_data(self, repo: str, pr_number: str) -> dict[str, Any] | None:
+        """Fetch PR data from Codeberg API"""
+        async with aiohttp.ClientSession() as session:
+            try:
+                url = CODEBERG_PR_API_URL.format(repo=repo, pr_number=pr_number)
+                async with session.get(url, headers=self._get_codeberg_headers()) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    else:
+                        logger.error(f"获取 Codeberg PR {repo}#{pr_number} 失败: {resp.status}")
+                        return None
+            except Exception as e:
+                logger.error(f"获取 Codeberg PR {repo}#{pr_number} 时出错: {e}")
+                return None
+
+    async def _fetch_codeberg_readme_data(self, repo: str) -> dict[str, Any] | None:
+        """Fetch README data from Codeberg API"""
+        async with aiohttp.ClientSession() as session:
+            try:
+                url = CODEBERG_README_API_URL.format(repo=repo)
+                async with session.get(url, headers=self._get_codeberg_headers()) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    else:
+                        logger.error(f"获取 Codeberg README {repo} 失败: {resp.status}")
+                        return None
+            except Exception as e:
+                logger.error(f"获取 Codeberg README {repo} 时出错: {e}")
+                return None
+
     @filter.command("ghlimit", alias={"ghrate"})
     async def check_rate_limit(self, event: AstrMessageEvent):
         """查看 GitHub API 速率限制状态"""
@@ -963,6 +1242,200 @@ class MyPlugin(Star):
     #     cairosvg.svg2png(url=fpath, write_to=png_fpath)
     #     # send image
     #     yield event.image_result(png_fpath)
+
+    # ==================== Codeberg Commands ====================
+
+    @filter.command("cbsub")
+    async def subscribe_codeberg_repo(self, event: AstrMessageEvent, repo: str):
+        """订阅 Codeberg 仓库的 Issue 和 PR。例如: /cbsub codeberg/community"""
+        if not self._is_valid_repo(repo):
+            yield event.plain_result("请提供有效的仓库名，格式为: 用户名/仓库名")
+            return
+
+        result = await self._subscribe_repo_internal(event, repo, "codeberg")
+        if result:
+            yield event.plain_result(result)
+            # Set as default repo for this conversation
+            self.default_repos[event.unified_msg_origin] = f"codeberg:{repo}"
+            self._save_default_repos()
+        else:
+            yield event.plain_result(f"仓库 {repo} 不存在或无法访问")
+
+    @filter.command("cbunsub")
+    async def unsubscribe_codeberg_repo(self, event: AstrMessageEvent, repo: str | None = None):
+        """取消订阅 Codeberg 仓库。例如: /cbunsub codeberg/community"""
+        subscriber_id = event.unified_msg_origin
+
+        if repo is None:
+            # Unsubscribe from all Codeberg repos
+            unsubscribed = []
+            for repo_name, subscribers in list(self.subscriptions.items()):
+                if repo_name.startswith("codeberg:") and subscriber_id in subscribers:
+                    subscribers.remove(subscriber_id)
+                    unsubscribed.append(repo_name.replace("codeberg:", ""))
+                    if not subscribers:
+                        del self.subscriptions[repo_name]
+
+            if unsubscribed:
+                self._save_subscriptions()
+                yield event.plain_result(f"已取消订阅所有 Codeberg 仓库: {', '.join(unsubscribed)}")
+            else:
+                yield event.plain_result("你没有订阅任何 Codeberg 仓库")
+            return
+
+        if not self._is_valid_repo(repo):
+            yield event.plain_result("请提供有效的仓库名，格式为: 用户名/仓库名")
+            return
+
+        repo_key = self._resolve_repo_key(repo, "codeberg")
+        if repo_key and subscriber_id in self.subscriptions.get(repo_key, []):
+            self.subscriptions[repo_key].remove(subscriber_id)
+            if not self.subscriptions[repo_key]:
+                del self.subscriptions[repo_key]
+            self._save_subscriptions()
+            yield event.plain_result(f"已取消订阅 Codeberg 仓库 {repo}")
+        else:
+            yield event.plain_result(f"你没有订阅 Codeberg 仓库 {repo}")
+
+    @filter.command("cblist")
+    async def list_codeberg_subscriptions(self, event: AstrMessageEvent):
+        """列出当前订阅的 Codeberg 仓库"""
+        subscriber_id = event.unified_msg_origin
+        subscribed_repos = []
+
+        for repo_key, subscribers in self.subscriptions.items():
+            if repo_key.startswith("codeberg:") and subscriber_id in subscribers:
+                subscribed_repos.append(repo_key.replace("codeberg:", ""))
+
+        if subscribed_repos:
+            yield event.plain_result(f"你当前订阅的 Codeberg 仓库有: {', '.join(subscribed_repos)}")
+        else:
+            yield event.plain_result("你当前没有订阅任何 Codeberg 仓库")
+
+    @filter.command("cbdefault", alias={"cbdef"})
+    async def set_codeberg_default_repo(self, event: AstrMessageEvent, repo: str | None = None):
+        """设置 Codeberg 默认仓库。例如: /cbdefault codeberg/community"""
+        if repo is None:
+            default_repo = self.default_repos.get(event.unified_msg_origin)
+            if default_repo and default_repo.startswith("codeberg:"):
+                yield event.plain_result(f"当前 Codeberg 默认仓库为: {default_repo.replace('codeberg:', '')}")
+            else:
+                yield event.plain_result("当前未设置 Codeberg 默认仓库")
+            return
+
+        if not self._is_valid_repo(repo):
+            yield event.plain_result("请提供有效的仓库名，格式为: 用户名/仓库名")
+            return
+
+        # Check if the repo exists
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    CODEBERG_API_URL.format(repo=repo), headers=self._get_codeberg_headers()
+                ) as resp:
+                    if resp.status != 200:
+                        yield event.plain_result(f"Codeberg 仓库 {repo} 不存在或无法访问")
+                        return
+                    repo_data = await resp.json()
+                    display_name = repo_data.get("full_name", repo)
+        except Exception as e:
+            logger.error(f"访问 Codeberg API 失败: {e}")
+            yield event.plain_result(f"检查仓库时出错: {str(e)}")
+            return
+
+        self.default_repos[event.unified_msg_origin] = f"codeberg:{display_name}"
+        self._save_default_repos()
+        yield event.plain_result(f"已将 Codeberg 仓库 {display_name} 设为默认仓库")
+
+    @filter.command("cbissue", alias={"cbis"})
+    async def get_codeberg_issue_details(self, event: AstrMessageEvent, issue_ref: str):
+        """获取 Codeberg Issue 详情。格式：/cbissue 用户名/仓库名#123"""
+        repo, issue_number = self._parse_issue_reference(issue_ref, event.unified_msg_origin, "codeberg")
+        if not repo or not issue_number:
+            yield event.plain_result("请提供有效的 Issue 引用，格式为：用户名/仓库名#123")
+            return
+
+        try:
+            issue_data = await self._fetch_codeberg_issue_data(repo, issue_number)
+            if not issue_data:
+                yield event.plain_result(f"无法获取 Issue {repo}#{issue_number} 的信息")
+                return
+
+            result = formatters.format_issue_details(repo, issue_data, platform="codeberg")
+            yield event.plain_result(result)
+        except Exception as e:
+            logger.error(f"获取 Codeberg Issue 详情时出错: {e}")
+            yield event.plain_result(f"获取 Issue 详情时出错: {str(e)}")
+
+    @filter.command("cbpr")
+    async def get_codeberg_pr_details(self, event: AstrMessageEvent, pr_ref: str):
+        """获取 Codeberg PR 详情。格式：/cbpr 用户名/仓库名#123"""
+        repo, pr_number = self._parse_issue_reference(pr_ref, event.unified_msg_origin, "codeberg")
+        if not repo or not pr_number:
+            yield event.plain_result("请提供有效的 PR 引用，格式为：用户名/仓库名#123")
+            return
+
+        try:
+            pr_data = await self._fetch_codeberg_pr_data(repo, pr_number)
+            if not pr_data:
+                yield event.plain_result(f"无法获取 PR {repo}#{pr_number} 的信息")
+                return
+
+            result = formatters.format_pr_details(repo, pr_data, platform="codeberg")
+            yield event.plain_result(result)
+        except Exception as e:
+            logger.error(f"获取 Codeberg PR 详情时出错: {e}")
+            yield event.plain_result(f"获取 PR 详情时出错: {str(e)}")
+
+    @filter.command("cbreadme")
+    async def get_codeberg_readme_details(self, event: AstrMessageEvent, readme_ref: str):
+        """查询 Codeberg 仓库的 README 信息。例如: /cbreadme codeberg/community"""
+        repo = self._parse_readme_reference(readme_ref)
+        if not repo:
+            yield event.plain_result("请提供有效的仓库引用，格式为：用户名/仓库名")
+            return
+
+        try:
+            readme_data = await self._fetch_codeberg_readme_data(repo)
+            if not readme_data:
+                yield event.plain_result(f"无法获取仓库 {repo} 的 README 信息")
+                return
+
+            content_base64 = readme_data.get("content", "")
+            try:
+                readme_content = base64.b64decode(content_base64).decode("utf-8")
+            except Exception as e:
+                logger.error(f"解码 README 内容失败: {e}")
+                yield event.plain_result(f"解码仓库 {repo} 的 README 内容时出错")
+                return
+
+            header = f"📖 Codeberg {repo} 的 README\n\n"
+            full_text = header + readme_content
+
+            try:
+                image_url = await self.text_to_image(full_text)
+                yield event.image_result(image_url)
+            except Exception as e:
+                logger.error(f"渲染 README 图片失败: {e}")
+                yield event.plain_result(full_text)
+        except Exception as e:
+            logger.error(f"获取 Codeberg README 详情时出错: {e}")
+            yield event.plain_result(f"获取 README 详情时出错: {str(e)}")
+
+    @filter.command("cblimit", alias={"cbrate"})
+    async def check_codeberg_rate_limit(self, event: AstrMessageEvent):
+        """查看 Codeberg API 状态（注意：Codeberg 没有公开的速率限制 API）"""
+        # Codeberg (Forgejo/Gitea) doesn't have a public rate limit API
+        message = (
+            "📊 Codeberg API 状态\n\n"
+            "Codeberg 基于 Forgejo，没有公开的速率限制查询 API。\n\n"
+        )
+        if self.codeberg_token:
+            message += "✅ 已配置 Codeberg Token，API 访问已认证"
+        else:
+            message += "⚠️ 未配置 Codeberg Token，部分功能可能受限"
+
+        yield event.plain_result(message)
 
     async def terminate(self):
         """Cleanup and save data before termination"""

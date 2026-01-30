@@ -1,6 +1,6 @@
-# GitHub Plugin for AstrBot
+# GitHub & Codeberg Plugin for AstrBot
 
-一个能够自动识别 GitHub 仓库链接并发送卡片图片的插件，同时支持订阅仓库的 Issue 和 PR 更新，查询 Issue 和 PR 详情。插件默认使用轮询检查更新，也可以开启 Webhook 模式以获得更及时和丰富的通知。
+一个能够自动识别 GitHub 仓库链接并发送卡片图片的插件，同时支持订阅 GitHub 和 Codeberg 仓库的 Issue 和 PR 更新，查询 Issue 和 PR 详情。插件默认使用轮询检查更新，也可以开启 Webhook 模式以获得更及时和丰富的通知。
 
 ## 功能
 
@@ -9,7 +9,8 @@
 3. 当订阅的仓库有新的 Issue、PR、评论、Star、Fork 等事件时自动发送通知
 4. 查询指定 Issue 或 PR 的详细信息
 5. 支持默认仓库设置，简化命令使用
-6. 查看 GitHub API 速率限制状态
+6. 查看 GitHub/Codeberg API 速率限制状态
+7. **支持 Codeberg 仓库** - 订阅、查询、Webhook 通知
 
 ## 使用方法
 
@@ -53,6 +54,32 @@
 
 - `/ghlimit` - 查看当前 GitHub API 速率限制状态
 - `/ghlink on/off` - 开启或关闭当前会话的 GitHub 链接自动解析功能
+
+## Codeberg 命令
+
+本插件支持 Codeberg 仓库的订阅和查询功能。所有 Codeberg 命令以 `/cb` 开头。
+
+### 订阅命令
+
+- `/cbsub 用户名/仓库名` - 订阅指定 Codeberg 仓库的更新
+- `/cbunsub 用户名/仓库名` - 取消订阅指定仓库
+- `/cbunsub` - 取消所有 Codeberg 订阅
+- `/cblist` - 列出当前已订阅的 Codeberg 仓库
+
+### 默认仓库设置
+
+- `/cbdefault 用户名/仓库名` - 设置 Codeberg 默认仓库
+- `/cbdefault` - 查看当前 Codeberg 默认仓库设置
+
+### 查询命令
+
+- `/cbissue 用户名/仓库名#123` - 查询指定 Issue 的详细信息
+- `/cbpr 用户名/仓库名#123` - 查询指定 PR 的详细信息
+- `/cbreadme 用户名/仓库名` - 查询仓库 README 信息
+
+### 工具命令
+
+- `/cblimit` - 查看 Codeberg API 状态
 
 ## Webhook 模式
 
@@ -102,6 +129,31 @@
 
 启用 Webhook 后，轮询任务会自动停止，减少不必要的 API 调用。如需退回到轮询模式，只需关闭配置项并重启插件即可。
 
+### Codeberg Webhook 配置
+
+Codeberg 也支持 Webhook 功能，配置方式与 GitHub 类似：
+
+1. 在 AstrBot 管理面板中启用 **使用 Codeberg Webhook**。
+2. 视需要调整以下选项：
+   - **Codeberg Webhook 路径**（默认 `/codeberg/webhook`）
+   - **Codeberg Webhook Secret**（可选，若设置需与 Codeberg Webhook 保持一致）
+3. 保存配置后重启 AstrBot 或重新加载插件。
+
+**Codeberg 端设置：**
+
+1. 前往目标仓库的 **Settings → Webhooks**。
+2. 点击 **Add Webhook** 并填写：
+   - **Target URL**：`http://<服务器公网地址>:<端口><路径>`（默认为 `http://your-host:6192/codeberg/webhook`）
+   - **HTTP Method**：`POST`
+   - **POST Content Type**：`application/json`
+   - **Secret**：若在插件中设置了 Secret，请在此填写相同内容
+3. 在 **Trigger On** 选择需要的事件类型，建议选择：
+   - `Issues`
+   - `Pull Request`
+   - `Create`
+   - `Fork`
+4. 保存设置。
+
 ## 示例
 
 ```bash
@@ -121,6 +173,18 @@
 /ghlimit
 ```
 
+# Codeberg 示例
+/cbsub codeberg/community
+
+# 设置 Codeberg 默认仓库
+/cbdefault codeberg/community
+
+# 查询 Codeberg Issue
+/cbissue codeberg/community#1
+
+# 查看 Codeberg API 状态
+/cblimit
+
 ## 配置项
 
 在 AstrBot 管理面板中可以配置以下选项：
@@ -133,6 +197,11 @@
 6. **Webhook 监听地址 / 端口 / 路径**：控制插件内部 HTTP 服务的监听参数
 7. **Webhook Secret**：可选，用于校验 GitHub Webhook 签名
 
+8. **Codeberg API 访问令牌**：可选，提供令牌可访问私有仓库
+9. **使用 Codeberg Webhook**：启用后可接收 Codeberg 仓库的实时事件
+10. **Codeberg Webhook 路径**：默认 `/codeberg/webhook`
+11. **Codeberg Webhook Secret**：可选，用于校验 Codeberg Webhook 签名
+
 ## 注意事项
 
 - 机器人会根据配置的时间间隔检查订阅的仓库更新（默认 30 分钟），Webhook 模式下不再发起轮询
@@ -141,3 +210,7 @@
 - 命令中的仓库名不区分大小写
 - 使用 GitHub API Token 可以提高 API 请求限制并访问私有仓库
 - 未使用 Token 时，API 速率限制为每小时 60 次请求；使用 Token 后可提高到每小时 5,000 次请求
+
+- Codeberg 基于 Forgejo/Gitea，API 与 GitHub 类似但有细微差异
+- Codeberg 没有公开的速率限制 API，但使用 Token 可获得更高的访问权限
+- GitHub 和 Codeberg 的订阅数据统一存储，使用平台前缀区分（如 `github:owner/repo`、`codeberg:owner/repo`）
