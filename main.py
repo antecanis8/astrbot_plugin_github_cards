@@ -105,6 +105,7 @@ class MyPlugin(Star):
             "codeberg_webhook_path", "/codeberg/webhook"
         )
         self.codeberg_webhook_secret = self.config.get("codeberg_webhook_secret", "")
+        self.use_ai_summary = bool(self.config.get("use_ai_summary", False))
         self.webhook_server: Any | None = None
         self.task: asyncio.Task[Any] | None = None
 
@@ -290,6 +291,46 @@ class MyPlugin(Star):
     def _normalize_repo_name(self, repo: str) -> str:
         """Normalize repository name according to configuration"""
         return repo.lower() if self.use_lowercase else repo
+
+    async def _summarize_body_with_ai(
+        self, event: AstrMessageEvent, body: str, content_type: str = "Issue"
+    ) -> str | None:
+        """Use AI to summarize the body content of an Issue or PR.
+        
+        Args:
+            event: The message event for getting chat context
+            body: The original body text to summarize
+            content_type: Either "Issue" or "PR" for context
+            
+        Returns:
+            Summarized text or None if AI is not available or fails
+        """
+        if not body or not body.strip():
+            return None
+
+        try:
+            umo = event.unified_msg_origin
+            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if not provider_id:
+                logger.debug("无法获取聊天模型ID，跳过AI总结")
+                return None
+
+            prompt = (
+                f"请用简洁的中文总结以下 Git {content_type} 的内容，"
+                f"保留关键信息，控制在100字以内：\n\n{body}"
+            )
+
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+            )
+
+            if llm_resp and llm_resp.completion_text:
+                return llm_resp.completion_text.strip()
+        except Exception as e:
+            logger.error(f"AI总结失败: {e}")
+
+        return None
 
     def _resolve_repo_key(self, repo: str, platform: str = "github") -> str | None:
         """Resolve stored subscription key that matches the provided repo name."""
@@ -945,8 +986,15 @@ class MyPlugin(Star):
                 )
                 return
 
+            # Use AI to summarize body if enabled
+            body_summary = None
+            if self.use_ai_summary and issue_data.get("body"):
+                body_summary = await self._summarize_body_with_ai(
+                    event, issue_data["body"], "Issue"
+                )
+
             # Format and send the issue details
-            result = formatters.format_issue_details(repo, issue_data)
+            result = formatters.format_issue_details(repo, issue_data, body_summary=body_summary)
             yield event.plain_result(result)
 
             # Send the issue card image if available
@@ -1016,8 +1064,15 @@ class MyPlugin(Star):
                 )
                 return
 
+            # Use AI to summarize body if enabled
+            body_summary = None
+            if self.use_ai_summary and pr_data.get("body"):
+                body_summary = await self._summarize_body_with_ai(
+                    event, pr_data["body"], "PR"
+                )
+
             # Format and send the PR details
-            result = formatters.format_pr_details(repo, pr_data)
+            result = formatters.format_pr_details(repo, pr_data, body_summary=body_summary)
             yield event.plain_result(result)
 
             # Send the PR card image if available
@@ -1443,7 +1498,16 @@ class MyPlugin(Star):
                 yield event.plain_result(f"无法获取 Issue {repo}#{issue_number} 的信息")
                 return
 
-            result = formatters.format_issue_details(repo, issue_data, platform="codeberg")
+            # Use AI to summarize body if enabled
+            body_summary = None
+            if self.use_ai_summary and issue_data.get("body"):
+                body_summary = await self._summarize_body_with_ai(
+                    event, issue_data["body"], "Issue"
+                )
+
+            result = formatters.format_issue_details(
+                repo, issue_data, platform="codeberg", body_summary=body_summary
+            )
             yield event.plain_result(result)
         except Exception as e:
             logger.error(f"获取 Codeberg Issue 详情时出错: {e}")
@@ -1463,7 +1527,16 @@ class MyPlugin(Star):
                 yield event.plain_result(f"无法获取 PR {repo}#{pr_number} 的信息")
                 return
 
-            result = formatters.format_pr_details(repo, pr_data, platform="codeberg")
+            # Use AI to summarize body if enabled
+            body_summary = None
+            if self.use_ai_summary and pr_data.get("body"):
+                body_summary = await self._summarize_body_with_ai(
+                    event, pr_data["body"], "PR"
+                )
+
+            result = formatters.format_pr_details(
+                repo, pr_data, platform="codeberg", body_summary=body_summary
+            )
             yield event.plain_result(result)
         except Exception as e:
             logger.error(f"获取 Codeberg PR 详情时出错: {e}")

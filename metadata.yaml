@@ -1,6 +1,6 @@
 name: astrbot_plugin_github_cards # 插件名称
 desc: GitHub/Codeberg 相关链接自动发送仓库简介/issue/pr卡片、订阅仓库事件 # 插件描述
 help:
-version: 1.2.0 # 插件版本
+version: 1.2.1 # 插件版本
 author: antecanis8 # 插件作者
 repo: https://github.com/antecanis8/astrbot_plugin_github_cards

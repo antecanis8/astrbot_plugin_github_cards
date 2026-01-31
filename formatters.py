@@ -428,7 +428,12 @@ def format_webhook_create_message(
     return "\n".join(message_lines)
 
 
-def format_issue_details(repo: str, issue_data: dict[str, Any], platform: str = "github") -> str:
+def format_issue_details(
+    repo: str,
+    issue_data: dict[str, Any],
+    platform: str = "github",
+    body_summary: str | None = None,
+) -> str:
     # if "pull_request" in issue_data:
     #     cmd_prefix = "gh" if platform == "github" else "cb"
     #     return f"#{issue_data['number']} 是一个 PR，请使用 /{cmd_prefix}pr 命令查看详情"
@@ -462,7 +467,9 @@ def format_issue_details(repo: str, issue_data: dict[str, Any], platform: str = 
         )
         result += f"指派给: {assignees}\n"
 
-    if issue_data.get("body"):
+    if body_summary:
+        result += f"\n内容概要 (AI 总结):\n{body_summary}\n"
+    elif issue_data.get("body"):
         body = issue_data["body"]
         if len(body) > 200:
             body = body[:197] + "..."
@@ -472,7 +479,12 @@ def format_issue_details(repo: str, issue_data: dict[str, Any], platform: str = 
     return result
 
 
-def format_pr_details(repo: str, pr_data: dict[str, Any], platform: str = "github") -> str:
+def format_pr_details(
+    repo: str,
+    pr_data: dict[str, Any],
+    platform: str = "github",
+    body_summary: str | None = None,
+) -> str:
     created_str = pr_data["created_at"].replace("Z", "+00:00")
     updated_str = pr_data["updated_at"].replace("Z", "+00:00")
 
@@ -520,7 +532,9 @@ def format_pr_details(repo: str, pr_data: dict[str, Any], platform: str = "githu
         f"文件变更: {pr_data.get('changed_files', 0)} 个\n"
     )
 
-    if pr_data.get("body"):
+    if body_summary:
+        result += f"\n内容概要 (AI 总结):\n{body_summary}\n"
+    elif pr_data.get("body"):
         body = pr_data["body"]
         if len(body) > 200:
             body = body[:197] + "..."

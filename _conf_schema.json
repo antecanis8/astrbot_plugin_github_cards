@@ -76,5 +76,11 @@
     "type": "string",
     "hint": "与 Codeberg Webhook 设置中的 Secret 保持一致以验证请求",
     "default": ""
+  },
+  "use_ai_summary": {
+    "description": "使用 AI 总结 Issue/PR 内容",
+    "type": "bool",
+    "hint": "启用后，查询 Issue/PR 详情时将使用 AI 对内容进行摘要总结",
+    "default": false
   }
 }
