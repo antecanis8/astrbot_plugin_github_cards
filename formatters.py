@@ -429,9 +429,9 @@ def format_webhook_create_message(
 
 
 def format_issue_details(repo: str, issue_data: dict[str, Any], platform: str = "github") -> str:
-    if "pull_request" in issue_data:
-        cmd_prefix = "gh" if platform == "github" else "cb"
-        return f"#{issue_data['number']} 是一个 PR，请使用 /{cmd_prefix}pr 命令查看详情"
+    # if "pull_request" in issue_data:
+    #     cmd_prefix = "gh" if platform == "github" else "cb"
+    #     return f"#{issue_data['number']} 是一个 PR，请使用 /{cmd_prefix}pr 命令查看详情"
 
     created_str = issue_data["created_at"].replace("Z", "+00:00")
     updated_str = issue_data["updated_at"].replace("Z", "+00:00")

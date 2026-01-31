@@ -17,6 +17,7 @@ from astrbot.api.star import Context, Star, register
 
 try:
     from . import formatters
+    from .query_helpers import parse_repo_number, resolve_issue_or_pr_details
     from .webhook_server import (
         GitHubWebhookServer,
         MultiPlatformWebhookServer,
@@ -28,6 +29,7 @@ try:
     from .platforms.base import PlatformProvider
 except ImportError:  # pragma: no cover - fallback for direct module import
     import formatters
+    from query_helpers import parse_repo_number, resolve_issue_or_pr_details
     from webhook_server import (
         GitHubWebhookServer,
         MultiPlatformWebhookServer,
@@ -627,15 +629,38 @@ class MyPlugin(Star):
             except Exception as e:
                 logger.error(f"检查仓库 {repo} 更新时出错: {e}")
 
-    async def _fetch_new_items(self, repo: str, last_check: str | None):
-        """Fetch new issues and PRs from a repository since last check"""
+    async def _fetch_new_items(self, repo_key: str, last_check: str | None):
+        """Fetch new issues and PRs from a repository since last check.
+        
+        Args:
+            repo_key: Repository key with platform prefix (e.g., 'github:owner/repo' or 'codeberg:owner/repo')
+            last_check: ISO format timestamp of last check, or None if first check
+        """
+        # Parse platform and repo name from the key
+        if repo_key.startswith("codeberg:"):
+            platform = "codeberg"
+            repo = repo_key.replace("codeberg:", "")
+            api_url = CODEBERG_ISSUES_API_URL.format(repo=repo)
+            headers = self._get_codeberg_headers()
+        elif repo_key.startswith("github:"):
+            platform = "github"
+            repo = repo_key.replace("github:", "")
+            api_url = GITHUB_ISSUES_API_URL.format(repo=repo)
+            headers = self._get_github_headers()
+        else:
+            # Legacy format: assume GitHub
+            platform = "github"
+            repo = repo_key
+            api_url = GITHUB_ISSUES_API_URL.format(repo=repo)
+            headers = self._get_github_headers()
+
         if not last_check:
             # If first time checking, just record current time and return empty list
             # Store as UTC timestamp without timezone info to avoid comparison issues
-            self.last_check_time[repo] = (
+            self.last_check_time[repo_key] = (
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
-            logger.info(f"初始化仓库 {repo} 的时间戳: {self.last_check_time[repo]}")
+            logger.info(f"初始化仓库 {repo_key} 的时间戳: {self.last_check_time[repo_key]}")
             return []
 
         try:
@@ -647,99 +672,123 @@ class MyPlugin(Star):
                 # If it somehow has timezone info, convert to naive UTC
                 last_check_dt = last_check_dt.replace(tzinfo=None)
 
-            logger.debug(f"仓库 {repo} 的上次检查时间: {last_check_dt.isoformat()}")
+            logger.debug(f"仓库 {repo_key} 的上次检查时间: {last_check_dt.isoformat()}")
             new_items = []
 
-            # GitHub API returns both issues and PRs in the issues endpoint
             async with aiohttp.ClientSession() as session:
                 try:
+                    # Both GitHub and Codeberg (Gitea) support similar query parameters
                     params = {
                         "sort": "created",
                         "direction": "desc",
                         "state": "all",
                         "per_page": 10,
                     }
+                    # Codeberg/Gitea uses 'limit' instead of 'per_page'
+                    if platform == "codeberg":
+                        params["limit"] = params.pop("per_page")
+
                     async with session.get(
-                        GITHUB_ISSUES_API_URL.format(repo=repo),
+                        api_url,
                         params=params,
-                        headers=self._get_github_headers(),
+                        headers=headers,
                     ) as resp:
                         if resp.status == 200:
                             items = await resp.json()
 
                             for item in items:
-                                # Convert GitHub's timestamp to naive UTC datetime for consistent comparison
-                                github_timestamp = item["created_at"].replace("Z", "")
-                                created_at = datetime.fromisoformat(github_timestamp)
+                                # Convert timestamp to naive UTC datetime for consistent comparison
+                                timestamp = item["created_at"].replace("Z", "")
+                                # Handle timezone offset like +00:00
+                                if "+" in timestamp:
+                                    timestamp = timestamp.split("+")[0]
+                                created_at = datetime.fromisoformat(timestamp)
 
                                 # Always remove timezone info for comparison
                                 created_at = created_at.replace(tzinfo=None)
 
                                 logger.debug(
-                                    f"比较: 仓库 {repo} 的 item #{item['number']} 创建于 {created_at.isoformat()}, 上次检查: {last_check_dt.isoformat()}"
+                                    f"比较: 仓库 {repo_key} 的 item #{item['number']} 创建于 {created_at.isoformat()}, 上次检查: {last_check_dt.isoformat()}"
                                 )
 
                                 if created_at > last_check_dt:
                                     logger.info(
-                                        f"发现新的 item #{item['number']} in {repo}"
+                                        f"发现新的 item #{item['number']} in {repo_key}"
                                     )
+                                    # Add platform info for notification formatting
+                                    item["_platform"] = platform
+                                    item["_repo"] = repo
                                     new_items.append(item)
                                 else:
                                     # Since items are sorted by creation time, we can break early
-                                    logger.debug(f"没有更多新 items in {repo}")
+                                    logger.debug(f"没有更多新 items in {repo_key}")
                                     break
                         else:
                             text = await resp.text()
                             if len(text) > 100:
                                 text = text[:100] + "..."
                             logger.error(
-                                f"获取仓库 {repo} 的 Issue/PR 失败: {resp.status}: {text}"
+                                f"获取仓库 {repo_key} 的 Issue/PR 失败: {resp.status}: {text}"
                             )
                 except Exception as e:
-                    logger.error(f"获取仓库 {repo} 的 Issue/PR 时出错: {e}")
+                    logger.error(f"获取仓库 {repo_key} 的 Issue/PR 时出错: {e}")
 
             # Update the last check time to now (UTC without timezone info)
             if new_items:
-                logger.info(f"找到 {len(new_items)} 个新的 items 在 {repo}")
+                logger.info(f"找到 {len(new_items)} 个新的 items 在 {repo_key}")
             else:
-                logger.debug(f"没有找到新的 items 在 {repo}")
+                logger.debug(f"没有找到新的 items 在 {repo_key}")
 
             # Always update the timestamp after checking, regardless of whether we found items
-            self.last_check_time[repo] = (
+            self.last_check_time[repo_key] = (
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
-            logger.debug(f"更新仓库 {repo} 的时间戳为: {self.last_check_time[repo]}")
+            logger.debug(f"更新仓库 {repo_key} 的时间戳为: {self.last_check_time[repo_key]}")
 
             return new_items
         except Exception as e:
             logger.error(f"解析时间时出错: {e}")
             # If we can't parse the time correctly, just return an empty list
             # and update the last check time to prevent continuous errors
-            self.last_check_time[repo] = (
+            self.last_check_time[repo_key] = (
                 datetime.utcnow().replace(microsecond=0).isoformat()
             )
             logger.info(
-                f"出错后更新仓库 {repo} 的时间戳为: {self.last_check_time[repo]}"
+                f"出错后更新仓库 {repo_key} 的时间戳为: {self.last_check_time[repo_key]}"
             )
             return []
 
-    async def _notify_subscribers(self, repo: str, new_items: list[dict[str, Any]]):
-        """Notify subscribers about new issues and PRs"""
+    async def _notify_subscribers(self, repo_key: str, new_items: list[dict[str, Any]]):
+        """Notify subscribers about new issues and PRs.
+        
+        Args:
+            repo_key: Repository key with platform prefix (e.g., 'github:owner/repo')
+            new_items: List of new issue/PR items with '_platform' and '_repo' metadata
+        """
         if not new_items:
             return
 
-        repo_key = self._resolve_repo_key(repo) or repo
+        resolved_key = self._resolve_repo_key(repo_key) or repo_key
 
-        for subscriber_id in self.subscriptions.get(repo_key, []):
+        for subscriber_id in self.subscriptions.get(resolved_key, []):
             try:
                 # Create notification message
                 for item in new_items:
-                    item_type = "PR" if "pull_request" in item else "Issue"
+                    # Get platform info from item metadata added by _fetch_new_items
+                    platform = item.get("_platform", "github")
+                    repo = item.get("_repo", repo_key)
+                    
+                    # Remove metadata keys before formatting
+                    item_clean = {k: v for k, v in item.items() if not k.startswith("_")}
+                    
+                    platform_label = "GitHub" if platform == "github" else "Codeberg"
+                    item_type = "PR" if "pull_request" in item_clean else "Issue"
+                    
                     message = (
-                        f"[GitHub 更新] 仓库 {repo} 有新的{item_type}:\n"
-                        f"#{item['number']} {item['title']}\n"
-                        f"作者: {item['user']['login']}\n"
-                        f"链接: {item['html_url']}"
+                        f"[{platform_label} 更新] 仓库 {repo} 有新的{item_type}:\n"
+                        f"#{item_clean['number']} {item_clean['title']}\n"
+                        f"作者: {item_clean['user']['login']}\n"
+                        f"链接: {item_clean['html_url']}"
                     )
 
                     # Send message to subscriber
@@ -915,6 +964,39 @@ class MyPlugin(Star):
         except Exception as e:
             logger.error(f"获取 Issue 详情时出错: {e}")
             yield event.plain_result(f"获取 Issue 详情时出错: {str(e)}")
+
+    @filter.command("cb")
+    async def quick_codeberg_lookup(self, event: AstrMessageEvent, ref: str):
+        """快捷查询 Codeberg Issue/PR。
+
+        格式：/cb 用户名/仓库名#123
+        也支持：/cb 123（使用 Codeberg 默认仓库或仅订阅的单个仓库）
+        """
+        repo, number = parse_repo_number(ref)
+        if not repo or not number:
+            repo, number = self._parse_issue_reference(ref, event.unified_msg_origin, "codeberg")
+
+        if not repo or not number:
+            yield event.plain_result("请提供有效的引用，例如：/cb ladaapp/lada#280")
+            return
+
+        try:
+            message = await resolve_issue_or_pr_details(
+                platform="codeberg",
+                repo=repo,
+                number=number,
+                fetch_issue=self._fetch_codeberg_issue_data,
+                fetch_pr=self._fetch_codeberg_pr_data,
+            )
+
+            if not message:
+                yield event.plain_result(f"无法获取 {repo}#{number} 的 Issue/PR 信息")
+                return
+
+            yield event.plain_result(message)
+        except Exception as e:
+            logger.error(f"快捷查询 Codeberg {repo}#{number} 时出错: {e}")
+            yield event.plain_result(f"查询时出错: {str(e)}")
 
     @filter.command("ghpr")
     async def get_pr_details(self, event: AstrMessageEvent, pr_ref: str):
