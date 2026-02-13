@@ -305,11 +305,27 @@ class MyPlugin(Star):
         Returns:
             Summarized text or None if AI is not available or fails
         """
+        return await self._summarize_body_with_ai_by_umo(
+            event.unified_msg_origin, body, content_type
+        )
+
+    async def _summarize_body_with_ai_by_umo(
+        self, umo: str, body: str, content_type: str = "Issue"
+    ) -> str | None:
+        """Use AI to summarize the body content using unified_msg_origin.
+        
+        Args:
+            umo: The unified_msg_origin for getting chat context
+            body: The original body text to summarize
+            content_type: Either "Issue" or "PR" for context
+            
+        Returns:
+            Summarized text or None if AI is not available or fails
+        """
         if not body or not body.strip():
             return None
 
         try:
-            umo = event.unified_msg_origin
             provider_id = await self.context.get_current_chat_provider_id(umo=umo)
             if not provider_id:
                 logger.debug("无法获取聊天模型ID，跳过AI总结")
@@ -825,12 +841,23 @@ class MyPlugin(Star):
                     platform_label = "GitHub" if platform == "github" else "Codeberg"
                     item_type = "PR" if "pull_request" in item_clean else "Issue"
                     
-                    message = (
-                        f"[{platform_label} 更新] 仓库 {repo} 有新的{item_type}:\n"
-                        f"#{item_clean['number']} {item_clean['title']}\n"
-                        f"作者: {item_clean['user']['login']}\n"
-                        f"链接: {item_clean['html_url']}"
-                    )
+                    # Build message with optional AI summary
+                    message_lines = [
+                        f"[{platform_label} 更新] 仓库 {repo} 有新的{item_type}:",
+                        f"#{item_clean['number']} {item_clean['title']}",
+                        f"作者: {item_clean['user']['login']}",
+                    ]
+
+                    # Add AI summary if enabled and body exists
+                    if self.use_ai_summary and item_clean.get("body"):
+                        body_summary = await self._summarize_body_with_ai_by_umo(
+                            subscriber_id, item_clean["body"], item_type
+                        )
+                        if body_summary:
+                            message_lines.append(f"内容概要 (AI 总结): {body_summary}")
+
+                    message_lines.append(f"链接: {item_clean['html_url']}")
+                    message = "\n".join(message_lines)
 
                     # Send message to subscriber
                     await self.context.send_message(

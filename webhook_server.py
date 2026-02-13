@@ -6,8 +6,13 @@ from typing import Callable, NotRequired, Protocol, TypedDict, cast, overload
 from quart import Quart, Response, request
 
 from astrbot.api import logger  # pyright: ignore[reportMissingTypeStubs]
-from platforms.base import PlatformProvider
-from platforms.github import GitHubProvider
+
+try:
+    from .platforms.base import PlatformProvider
+    from .platforms.github import GitHubProvider
+except ImportError:  # pragma: no cover - fallback for direct module import
+    from platforms.base import PlatformProvider
+    from platforms.github import GitHubProvider
 
 
 class PlatformConfig(TypedDict):
