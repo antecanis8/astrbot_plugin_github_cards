@@ -5,7 +5,7 @@ import os
 import re
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, cast
 
 import aiohttp
@@ -17,7 +17,11 @@ from astrbot.api.star import Context, Star, register
 
 try:
     from . import formatters
-    from .query_helpers import parse_repo_number, resolve_issue_or_pr_details
+    from .query_helpers import (
+        is_pull_request_item,
+        parse_repo_number,
+        resolve_issue_or_pr_details,
+    )
     from .webhook_server import (
         GitHubWebhookServer,
         MultiPlatformWebhookServer,
@@ -29,7 +33,11 @@ try:
     from .platforms.base import PlatformProvider
 except ImportError:  # pragma: no cover - fallback for direct module import
     import formatters
-    from query_helpers import parse_repo_number, resolve_issue_or_pr_details
+    from query_helpers import (
+        is_pull_request_item,
+        parse_repo_number,
+        resolve_issue_or_pr_details,
+    )
     from webhook_server import (
         GitHubWebhookServer,
         MultiPlatformWebhookServer,
@@ -640,6 +648,34 @@ class MyPlugin(Star):
         """Check if the repository name is valid"""
         return bool(re.match(r"[\w\-]+/[\w\-]+$", repo))
 
+    @staticmethod
+    def _utc_now_naive() -> datetime:
+        """Get current UTC time without timezone info for stable comparisons."""
+        return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+
+    @staticmethod
+    def _parse_iso_datetime(value: str | None) -> datetime | None:
+        """Parse an ISO timestamp and normalize to naive UTC datetime."""
+        if not value:
+            return None
+
+        text = value.strip()
+        if not text:
+            return None
+
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
+        return parsed
+
     async def _check_updates_periodically(self):
         """Periodically check for updates in subscribed repositories"""
         if self.enable_webhook:
@@ -678,9 +714,6 @@ class MyPlugin(Star):
                 new_items = await self._fetch_new_items(repo, last_check)
 
                 if new_items:
-                    # Update last check time
-                    self.last_check_time[repo] = datetime.now().isoformat()
-
                     # Notify subscribers about new items
                     await self._notify_subscribers(repo, new_items)
             except Exception as e:
@@ -711,26 +744,25 @@ class MyPlugin(Star):
             api_url = GITHUB_ISSUES_API_URL.format(repo=repo)
             headers = self._get_github_headers()
 
+        check_started = self._utc_now_naive()
+
         if not last_check:
             # If first time checking, just record current time and return empty list
-            # Store as UTC timestamp without timezone info to avoid comparison issues
-            self.last_check_time[repo_key] = (
-                datetime.utcnow().replace(microsecond=0).isoformat()
-            )
+            self.last_check_time[repo_key] = check_started.isoformat()
             logger.info(f"初始化仓库 {repo_key} 的时间戳: {self.last_check_time[repo_key]}")
             return []
 
         try:
-            # Always treat stored timestamps as UTC without timezone info
-            last_check_dt = datetime.fromisoformat(last_check)
-
-            # Ensure it's treated as naive datetime
-            if hasattr(last_check_dt, "tzinfo") and last_check_dt.tzinfo is not None:
-                # If it somehow has timezone info, convert to naive UTC
-                last_check_dt = last_check_dt.replace(tzinfo=None)
+            last_check_dt = self._parse_iso_datetime(last_check)
+            if not last_check_dt:
+                logger.warning(f"仓库 {repo_key} 的上次检查时间格式无效: {last_check}")
+                self.last_check_time[repo_key] = check_started.isoformat()
+                return []
 
             logger.debug(f"仓库 {repo_key} 的上次检查时间: {last_check_dt.isoformat()}")
             new_items = []
+            latest_seen_dt = last_check_dt
+            seen_item_numbers: set[str] = set()
 
             async with aiohttp.ClientSession() as session:
                 try:
@@ -754,32 +786,44 @@ class MyPlugin(Star):
                             items = await resp.json()
 
                             for item in items:
-                                # Convert timestamp to naive UTC datetime for consistent comparison
-                                timestamp = item["created_at"].replace("Z", "")
-                                # Handle timezone offset like +00:00
-                                if "+" in timestamp:
-                                    timestamp = timestamp.split("+")[0]
-                                created_at = datetime.fromisoformat(timestamp)
+                                if not isinstance(item, dict):
+                                    continue
 
-                                # Always remove timezone info for comparison
-                                created_at = created_at.replace(tzinfo=None)
+                                item_number = item.get("number")
+                                item_number_key = (
+                                    str(item_number)
+                                    if item_number is not None
+                                    else str(item.get("id", ""))
+                                )
+                                if item_number_key and item_number_key in seen_item_numbers:
+                                    continue
+                                if item_number_key:
+                                    seen_item_numbers.add(item_number_key)
+
+                                created_at = self._parse_iso_datetime(
+                                    cast(str | None, item.get("created_at"))
+                                )
+                                if not created_at:
+                                    logger.debug(
+                                        f"跳过仓库 {repo_key} 的 item，created_at 无效: {item.get('created_at')}"
+                                    )
+                                    continue
+
+                                if created_at > latest_seen_dt:
+                                    latest_seen_dt = created_at
 
                                 logger.debug(
-                                    f"比较: 仓库 {repo_key} 的 item #{item['number']} 创建于 {created_at.isoformat()}, 上次检查: {last_check_dt.isoformat()}"
+                                    f"比较: 仓库 {repo_key} 的 item #{item_number} 创建于 {created_at.isoformat()}, 上次检查: {last_check_dt.isoformat()}"
                                 )
 
                                 if created_at > last_check_dt:
                                     logger.info(
-                                        f"发现新的 item #{item['number']} in {repo_key}"
+                                        f"发现新的 item #{item_number} in {repo_key}"
                                     )
                                     # Add platform info for notification formatting
                                     item["_platform"] = platform
                                     item["_repo"] = repo
                                     new_items.append(item)
-                                else:
-                                    # Since items are sorted by creation time, we can break early
-                                    logger.debug(f"没有更多新 items in {repo_key}")
-                                    break
                         else:
                             text = await resp.text()
                             if len(text) > 100:
@@ -796,10 +840,9 @@ class MyPlugin(Star):
             else:
                 logger.debug(f"没有找到新的 items 在 {repo_key}")
 
-            # Always update the timestamp after checking, regardless of whether we found items
-            self.last_check_time[repo_key] = (
-                datetime.utcnow().replace(microsecond=0).isoformat()
-            )
+            # Advance cursor with latest seen creation time to avoid re-sending same items.
+            next_check_dt = max(check_started, latest_seen_dt)
+            self.last_check_time[repo_key] = next_check_dt.isoformat()
             logger.debug(f"更新仓库 {repo_key} 的时间戳为: {self.last_check_time[repo_key]}")
 
             return new_items
@@ -807,9 +850,7 @@ class MyPlugin(Star):
             logger.error(f"解析时间时出错: {e}")
             # If we can't parse the time correctly, just return an empty list
             # and update the last check time to prevent continuous errors
-            self.last_check_time[repo_key] = (
-                datetime.utcnow().replace(microsecond=0).isoformat()
-            )
+            self.last_check_time[repo_key] = check_started.isoformat()
             logger.info(
                 f"出错后更新仓库 {repo_key} 的时间戳为: {self.last_check_time[repo_key]}"
             )
@@ -839,7 +880,7 @@ class MyPlugin(Star):
                     item_clean = {k: v for k, v in item.items() if not k.startswith("_")}
                     
                     platform_label = "GitHub" if platform == "github" else "Codeberg"
-                    item_type = "PR" if "pull_request" in item_clean else "Issue"
+                    item_type = "PR" if is_pull_request_item(item_clean) else "Issue"
                     
                     # Build message with optional AI summary
                     message_lines = [

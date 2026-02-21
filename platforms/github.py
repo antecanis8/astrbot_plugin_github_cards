@@ -1,6 +1,6 @@
 import hashlib
 import hmac
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -292,11 +292,12 @@ class GitHubProvider(PlatformProvider):
         if not value:
             return None
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", ""))
+            text = value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(text)
         except Exception:
             return None
         if parsed.tzinfo is not None:
-            parsed = parsed.replace(tzinfo=None)
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
         return parsed
 
     @staticmethod
